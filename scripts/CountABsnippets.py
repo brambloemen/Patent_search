@@ -1,0 +1,40 @@
+import pandas as pd
+import csv
+from flashtext import KeywordProcessor
+
+# 1. Load your existing results
+input_csv = '../results/claimsFoodFeedVitSuppEnz_C12N_snip_class_gptoss20b.csv'
+df = pd.read_csv(input_csv)
+
+# 2. Setup FlashText
+# --- Load Antibiotic Names ---
+antibiotic_file = '../CARD_ontology/antibiotics_CARD_aro.csv'
+antibiotics = []
+with open(antibiotic_file, 'r') as f:
+    reader = csv.reader(f)
+    for row in reader:
+        antibiotics.append(row[0].lower())
+
+
+processor = KeywordProcessor(case_sensitive=False)
+for name in antibiotics:
+    processor.add_keyword(name)
+
+
+# 3. Define a helper function to apply to the 'snippet_text' column
+def get_antibiotic_stats(text):
+    if not isinstance(text, str): return pd.Series([0, ""])
+    
+    found = processor.extract_keywords(text)
+    unique = sorted(list(set(found)))
+    
+    return pd.Series([len(unique), ", ".join(unique)])
+
+# 4. Apply it efficiently
+df[['antibiotic_count', 'antibiotics_found']] = df['snippet_text'].apply(get_antibiotic_stats)
+
+# 5. Save the updated file
+output_csv = input_csv.replace('.csv', '_with_counts.csv')
+df.to_csv(output_csv, index=False)
+
+print(df[['patent_id', 'antibiotic_count', 'antibiotics_found']].head())
