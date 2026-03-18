@@ -10,6 +10,10 @@ import os
 from dotenv import load_dotenv
 """
 Code is a manual/AI hybrid generated with gemini 3: https://gemini.google.com/share/fbb53ca43596
+
+Script analyzes patents claims and descriptions for mentions of antibiotics (derived using the CARD_aro_ontology.py script) 
+and classifies each mentions using a single prompt to an LLM (gpt-oss-20b). The prompt contains the mention and surrounding context.
+The output is a CSV file with the patent ID, snippet type (claim or description), the snippet text, the assigned category, and the reason for that category. 
 """
 
 
@@ -21,23 +25,16 @@ client = OpenAI(
 )
 
 # --- Load Antibiotic Names ---
-antibiotic_file = '../CARD_ontology/antibiotics_CARD_aro.csv'
+antibiotic_file = '../CARD_ontology/antibiotics_list.txt'
 antibiotics = []
 with open(antibiotic_file, 'r') as f:
-    reader = csv.reader(f)
-    for row in reader:
-        antibiotics.append(row[0].lower())
+    for line in f:
+        antibiotics.append(line.rstrip().lower())
 
 
 processor = KeywordProcessor(case_sensitive=False)
 for name in antibiotics:
     processor.add_keyword(name)
-
-
-# --- Load Resistance Genes and Terms ---
-resistance_gene_file = '../CARD_ontology/aro.tsv'
-resistance_genes = pd.read_csv(resistance_gene_file, sep='\t')["Name"]
-resistance_terms = ["selection marker", "selectable marker", "marker gene"]
 
 
 def get_merged_snippets_flashtext(text, processor, window=300):
@@ -87,23 +84,38 @@ def get_merged_snippets_flashtext(text, processor, window=300):
 
 # --- llm-classifier function ---
 MODEL_NAME="openai/gpt-oss-20b"
-PROMPT_TEMPLATE = """
-INSTRUCTIONS:
-You are a patent analyst. Classify the patent snippet below into one of these categories:
-- MARKER: The antibiotic is used as a selection marker or the strain carries resistance.
-- AVOIDANCE: The patent describes food-grade markers, marker-free systems, or antibiotic susceptibility of a strain.
-- MARKER_AVOIDANCE: Both MARKER and AVOIDANCE aspects are described.
-- UNKNOWN: Irrelevant context or general chemical lists.
-- BINGO: The antibiotic resistance marker is used during production of food or feed products.
+PROMPT_TEMPLATE = """You are a patent analyst. Classify the antibiotic-related patent snippet below.
 
-SNIPPET TO ANALYZE:
-\"\"\"
-{snippet_text}
-\"\"\"
+CATEGORIES:
+- BINGO: Antibiotic resistance marker used in a food/feed production strain
+- MARKER: Antibiotic used as bacterial selection marker
+- AVOIDANCE: Non-antibiotic marker, marker-free system, marker removal, or antibiotic susceptibility
+- MARKER_AVOIDANCE: Both MARKER and AVOIDANCE aspects present
+- EUKARYOTIC: Antibiotic used in eukaryotic context
+- UNKNOWN: Irrelevant context or general chemical list
 
-RESPONSE FORMAT:
-Return ONLY a JSON object: {{"category": "MARKER" | "AVOIDANCE" | "UNKNOWN" | "BINGO", "reason": "one sentence explanation"}}
-"""
+SNIPPET:
+\"\"\"{snippet_text}\"\"\"
+
+Return ONLY JSON: {{"category": "BINGO"|"MARKER"|"AVOIDANCE"|"MARKER_AVOIDANCE"|"EUKARYOTIC"|"UNKNOWN", "reason": "one sentence"}}"""
+# PROMPT_TEMPLATE = """
+# INSTRUCTIONS:
+# You are a patent analyst. Classify the patent snippet below that describes use of antibiotic into one of these categories:
+# - BINGO: The antibiotic resistance marker is used in a production strain of food or feed products.
+# - MARKER: Antibiotic is used as bacterial selection marker.
+# - AVOIDANCE: Snippet describes non-antibiotic marker, marker-free systems, marker removal, or antibiotic susceptibility.
+# - MARKER_AVOIDANCE: Both MARKER and AVOIDANCE aspects are described.
+# - EUKARYOTIC: Snippet describes use of antibiotics in eukaryotic contexts.
+# - UNKNOWN: Irrelevant context or general chemical lists.
+
+# SNIPPET TO ANALYZE:
+# \"\"\"
+# {snippet_text}
+# \"\"\"
+
+# RESPONSE FORMAT:
+# Return ONLY a JSON object: {{"category": "MARKER" | "AVOIDANCE" | "EUKARYOTIC" | "MARKER_AVOIDANCE" | "UNKNOWN" | "BINGO", "reason": "one sentence explanation"}}
+# """
 
 def categorize_with_llm(text_snippet):
     """Sends the integrated prompt + data in a single request."""
@@ -223,38 +235,52 @@ test_snippet = snippets.popitem()[1]['snippets_desc'][0]
 print(test_patent_id)
 print(test_snippet)
 print(categorize_with_llm(test_snippet)["category"])  # test run
+total_snippets = sum(len(v['snippets_claims']) + len(v['snippets_desc']) for v in snippets.values())
+total_snippets_length = sum(len(snip) for v in snippets.values() for snip in v['snippets_claims'] + v['snippets_desc'])
 
-# snippet_classifications = pd.DataFrame(columns=['patent_id', 'snippet_type', 
-#                                                 'snippet_text', 'category', 
-#                                                 'reason', 'input_tokens', 
-#                                                 'output_tokens', 'duration_sec', 
-#                                                 'ratelimit_remaining_req', 
-#                                                 'ratelimit_remaining_tok', 'was_over_limit'])
+"""
+To get an idea of costs: total number of snippets (= total LLM calls) and total character count (~ linear relation to nr tokens).
+"""
+print(f"Total snippets to classify: {total_snippets}")
+print(f"Total snippet length: {total_snippets_length / 10**6}M characters.")
+print(f"Estimated total tokens: {total_snippets*len(PROMPT_TEMPLATE)/4/10**6 + total_snippets_length/4/10**6}M tokens (assuming ~4 chars/token).")
 
-# for pat, snip in tqdm(snippets.items()):
-#     for claim_snip in snip['snippets_claims']:
-#         analysis = categorize_with_llm(claim_snip)
+
+snippet_classifications = pd.DataFrame(columns=['patent_id', 'snippet_type', 
+                                                'snippet_text', 'category', 
+                                                'reason', 'input_tokens', 
+                                                'output_tokens', 'duration_sec', 
+                                                'ratelimit_remaining_req', 
+                                                'ratelimit_remaining_tok', 'was_over_limit'])
+
+"""
+Loop iterating through all patents in dataset.
+Best run some trials on a subset before running all patents, to get an idea of costs and runtime.
+"""
+for pat, snip in tqdm(snippets.items()):
+    for claim_snip in snip['snippets_claims']:
+        analysis = categorize_with_llm(claim_snip)
         
-#         new_row = pd.DataFrame([{
-#             'patent_id': pat,
-#             'snippet_type': 'claim',
-#             'snippet_text': claim_snip,
-#             **analysis
-#         }])
+        new_row = pd.DataFrame([{
+            'patent_id': pat,
+            'snippet_type': 'claim',
+            'snippet_text': claim_snip,
+            **analysis
+        }])
 
-#         snippet_classifications = pd.concat([snippet_classifications, new_row], ignore_index=True)
+        snippet_classifications = pd.concat([snippet_classifications, new_row], ignore_index=True)
     
-#     for desc_snip in snip['snippets_desc']:
-#         analysis = categorize_with_llm(desc_snip)
+    for desc_snip in snip['snippets_desc']:
+        analysis = categorize_with_llm(desc_snip)
         
-#         new_row = pd.DataFrame([{
-#             'patent_id': pat,
-#             'snippet_type': 'description',
-#             'snippet_text': desc_snip,
-#             **analysis
-#         }])
+        new_row = pd.DataFrame([{
+            'patent_id': pat,
+            'snippet_type': 'description',
+            'snippet_text': desc_snip,
+            **analysis
+        }])
 
-#         snippet_classifications = pd.concat([snippet_classifications, new_row], ignore_index=True)
+        snippet_classifications = pd.concat([snippet_classifications, new_row], ignore_index=True)
 
-# snippet_classifications.to_csv('../results/claimsFoodFeedVitSuppEnz_C12N_snip_class_gptoss20b.csv', index=False)
+snippet_classifications.to_csv('../results/claimsFoodFeedVitSuppEnz_C12N_snip_class_gptoss20b.tsv', sep="\t", index=False)
 

@@ -2,9 +2,13 @@ import pandas as pd
 import csv
 from flashtext import KeywordProcessor
 
+"""
+This script is to be run on the output csv file from the LLM classification step, which contains the 'snippet_text' column.
+It will count the number of unique antibiotic names found in each snippet and also list which antibiotics were found.
+"""
 # 1. Load your existing results
-input_csv = '../results/claimsFoodFeedVitSuppEnz_C12N_snip_class_gptoss20b.csv'
-df = pd.read_csv(input_csv)
+input_csv = '../results/claimsFoodFeedVitSuppEnz_C12N_snip_class_gptoss20b.tsv'
+df = pd.read_csv(input_csv, sep='\t')
 
 # 2. Setup FlashText
 # --- Load Antibiotic Names ---
