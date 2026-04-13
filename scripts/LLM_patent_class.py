@@ -84,6 +84,7 @@ def get_merged_snippets_flashtext(text, processor, window=300):
 
 # --- llm-classifier function ---
 MODEL_NAME="openai/gpt-oss-20b"
+# TODO: reason can be shorter to reduce output token count (largest fraction of output costs)
 PROMPT_TEMPLATE = """You are a patent analyst. Classify the antibiotic-related patent snippet below.
 
 CATEGORIES:

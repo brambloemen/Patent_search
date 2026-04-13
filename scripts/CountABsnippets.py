@@ -12,12 +12,11 @@ df = pd.read_csv(input_csv, sep='\t')
 
 # 2. Setup FlashText
 # --- Load Antibiotic Names ---
-antibiotic_file = '../CARD_ontology/antibiotics_CARD_aro.csv'
+antibiotic_file = '../CARD_ontology/antibiotics_list.txt'
 antibiotics = []
 with open(antibiotic_file, 'r') as f:
-    reader = csv.reader(f)
-    for row in reader:
-        antibiotics.append(row[0].lower())
+    for line in f:
+        antibiotics.append(line.rstrip().lower())
 
 
 processor = KeywordProcessor(case_sensitive=False)
@@ -38,7 +37,7 @@ def get_antibiotic_stats(text):
 df[['antibiotic_count', 'antibiotics_found']] = df['snippet_text'].apply(get_antibiotic_stats)
 
 # 5. Save the updated file
-output_csv = input_csv.replace('.csv', '_with_counts.csv')
+output_csv = input_csv.replace('.tsv', '_with_counts.tsv')
 df.to_csv(output_csv, index=False)
 
 print(df[['patent_id', 'antibiotic_count', 'antibiotics_found']].head())
