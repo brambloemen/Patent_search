@@ -72,6 +72,8 @@ The classification script uses the [Nebius API](https://nebius.com/) with an Ope
 
 Export patents from [Lens.org](https://www.lens.org/) filtered by CPC codes `C12N`, `A21`, and `A23`. Save the export as `Lens_export_cpc_C12N_A21_A23.json`. The downstream scripts expect a pre-filtered JSONL file (`claims_FoodFeedSuppVitEnz_C12N.json`) with one patent record per line.
 
+Download antibiotic ontology from [CARD]:(https://card.mcmaster.ca/download). Extract the contents into a directory CARD_ontology 
+
 ## Running the Pipeline
 
 Run scripts in order from the `scripts/` directory:
