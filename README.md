@@ -90,7 +90,7 @@ python LLM_patent_class.py
 python CountABsnippets.py
 ```
 
-> **Cost warning**: `LLM_patent_class.py` estimates total token usage before running and prompts for confirmation. The dataset is large (~1.5 GB of patent text), so review the estimate before proceeding.
+> **Cost warning**: `LLM_patent_class.py` runs on all input. If the dataset is large (e.g. ~1.5 GB of patent text in my usecase), try to run on a subset first and review the cost/token usage estimate before proceeding.
 
 ## Classification Categories
 
