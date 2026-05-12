@@ -4,9 +4,9 @@ A pipeline for identifying and classifying antibiotic resistance (AR) marker usa
 
 ## Overview
 
-This project screens patents in CPC classifications **C12N** (microbiology/genetics), **A21** (bakery), and **A23** (food/feed) for mentions of antibiotics. Each mention is extracted with surrounding context and classified by an LLM into categories reflecting how the antibiotic is used — as a selection marker in a production strain, in a marker-avoidance system, in a eukaryotic context, or irrelevant noise.
+This project screens patents (obtained from lens.org) for mentions of antibiotics. Each mention is extracted with surrounding context and classified by an LLM into categories reflecting how the antibiotic is used - as a selection marker in a production strain, in a marker-avoidance system, in a eukaryotic context, or noise.
 
-A second, more general script (`PatentClassification.py`) classifies the same patents by end product, production organism, product category, and sector without any antibiotic-specific filtering.
+A second, more general script (`PatentClassification.py`) classifies patents by end product, production organism, product category, and sector without any antibiotic-specific filtering.
 
 Patent data is sourced from [Lens.org](https://www.lens.org/). Antibiotic names are derived from the [CARD Antibiotic Resistance Ontology](https://card.mcmaster.ca/) (ARO).
 
@@ -72,7 +72,7 @@ GOOGLE_API_KEY=your_key_here   # only needed for --provider google
 
 **3. Obtain input data**
 
-Export patents from [Lens.org](https://www.lens.org/) filtered by CPC codes `C12N`, `A21`, and `A23`. The classification scripts expect a JSONL file with one Lens.org patent record per line.
+Export patents from [Lens.org](https://www.lens.org/) for your query of interest (e.g. filtered by CPC codes `C12N`, `A21`, and `A23`). The classification scripts expect a JSONL file with one Lens.org patent record per line.
 
 Download the antibiotic ontology from [CARD](https://card.mcmaster.ca/download) and extract the contents into a `CARD_ontology/` directory.
 
@@ -104,7 +104,7 @@ Optional flags:
 
 Output is written incrementally to `results/<input_basename>_snip_class_<model>.tsv`. The script can be safely interrupted and resumed with the same command — already-classified snippets are skipped.
 
-> **Cost note**: the script logs estimated token usage before starting. For large datasets (e.g. ~1.5 GB of patent text), run on a subset first to gauge costs.
+> **Cost note**: the script logs estimated token usage. For large datasets, run on a subset of patents first to estimate costs to avoid unexpected bills or rate limits.
 
 **3. Annotate results with antibiotic counts**
 
