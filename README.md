@@ -6,27 +6,29 @@ A pipeline for identifying and classifying antibiotic resistance (AR) marker usa
 
 This project screens patents in CPC classifications **C12N** (microbiology/genetics), **A21** (bakery), and **A23** (food/feed) for mentions of antibiotics. Each mention is extracted with surrounding context and classified by an LLM into categories reflecting how the antibiotic is used — as a selection marker in a production strain, in a marker-avoidance system, in a eukaryotic context, or irrelevant noise.
 
+A second, more general script (`PatentClassification.py`) classifies the same patents by end product, production organism, product category, and sector without any antibiotic-specific filtering.
+
 Patent data is sourced from [Lens.org](https://www.lens.org/). Antibiotic names are derived from the [CARD Antibiotic Resistance Ontology](https://card.mcmaster.ca/) (ARO).
 
 ## Workflow
 
 ```
-Lens API export (JSON)
+Lens API export (JSONL)
         │
+        ├──────────────────────────────────────────────────────┐
+        ▼                                                       ▼
+CARD_aro_ontology.py                               PatentClassification.py
+→ antibiotics_list.txt (672 antibiotic names)      → end product / organism /
+        │                                            sector classification (TSV)
         ▼
-Patent_metadata.py          → metadata CSV (lens_id, title, word counts)
-        │
-        ▼
-CARD_aro_ontology.py        → antibiotics_list.txt  (672 antibiotic names)
-        │
-        ▼
-LLM_patent_class.py         → snippet extraction + LLM classification (TSV)
+Classify_Antibiotic_Snippets.py
   ├─ FlashText keyword match
   ├─ Context window extraction (±300 chars)
-  └─ Nebius gpt-oss-20b classification
+  └─ LLM classification of each snippet (TSV)
         │
         ▼
-CountABsnippets.py          → annotated results with per-snippet antibiotic counts
+CountABsnippets.py
+→ annotated results with per-snippet antibiotic counts
 ```
 
 ## Repository Structure
@@ -34,19 +36,20 @@ CountABsnippets.py          → annotated results with per-snippet antibiotic co
 ```
 Patent_search/
 ├── scripts/
-│   ├── CARD_aro_ontology.py       # Extract antibiotic names from CARD ARO
-│   ├── Patent_metadata.py         # Extract patent metadata from Lens export
-│   ├── LLM_patent_class.py        # Main pipeline: keyword match + LLM classify
-│   └── CountABsnippets.py         # Annotate results with antibiotic counts
+│   ├── CARD_aro_ontology.py              # Extract antibiotic names from CARD ARO
+│   ├── Patent_metadata.py                # Extract patent metadata from Lens export
+│   ├── Classify_Antibiotic_Snippets.py   # Antibiotic mention detection + LLM classification
+│   ├── PatentClassification.py           # General patent product/sector classification
+│   └── CountABsnippets.py                # Annotate snippet results with antibiotic counts
 ├── CARD_ontology/
-│   ├── aro.json / aro.obo         # Antibiotic Resistance Ontology (CARD 2023)
-│   ├── mo.json, ro.json           # Model and Relationship Ontologies
-│   ├── ncbi_taxonomy.json         # NCBI Taxonomy
-│   └── antibiotics_list.txt       # Derived list of 672 antibiotic names
-├── results/                        # Pipeline output CSVs
+│   ├── aro.json / aro.obo                # Antibiotic Resistance Ontology (CARD 2023)
+│   ├── mo.json, ro.json                  # Model and Relationship Ontologies
+│   ├── ncbi_taxonomy.json                # NCBI Taxonomy
+│   └── antibiotics_list.txt             # Derived list of 672 antibiotic names
+├── results/                              # Pipeline output TSVs/CSVs
 ├── envs/
-│   └── patent.yaml                # Conda environment
-└── .env                           # NEBIUS_API_KEY (not committed)
+│   └── patent.yaml                       # Conda environment
+└── .env                                  # API keys (not committed)
 ```
 
 ## Setup
@@ -64,37 +67,70 @@ Create a `.env` file in the repository root:
 
 ```
 NEBIUS_API_KEY=your_key_here
+GOOGLE_API_KEY=your_key_here   # only needed for --provider google
 ```
-
-The classification script uses the [Nebius API](https://nebius.com/) with an OpenAI-compatible interface to run `gpt-oss-20b`.
 
 **3. Obtain input data**
 
-Export patents from [Lens.org](https://www.lens.org/) filtered by CPC codes `C12N`, `A21`, and `A23`. Save the export as `Lens_export_cpc_C12N_A21_A23.json`. The downstream scripts expect a pre-filtered JSONL file (`claims_FoodFeedSuppVitEnz_C12N.json`) with one patent record per line.
+Export patents from [Lens.org](https://www.lens.org/) filtered by CPC codes `C12N`, `A21`, and `A23`. The classification scripts expect a JSONL file with one Lens.org patent record per line.
 
-Download antibiotic ontology from [CARD]:(https://card.mcmaster.ca/download). Extract the contents into a directory CARD_ontology 
+Download the antibiotic ontology from [CARD](https://card.mcmaster.ca/download) and extract the contents into a `CARD_ontology/` directory.
 
 ## Running the Pipeline
 
-Run scripts in order from the `scripts/` directory:
+Run scripts from the `scripts/` directory.
+
+**1. Build the antibiotic name list** (once, from CARD ontology)
 
 ```bash
-# 1. Build antibiotic name list from CARD ontology
 python CARD_aro_ontology.py
+```
 
-# 2. Extract patent metadata
-python Patent_metadata.py
+**2. Classify antibiotic snippets** (main antibiotic-focused pipeline)
 
-# 3. Classify antibiotic mentions with LLM (main step — expensive)
-python LLM_patent_class.py
+```bash
+python Classify_Antibiotic_Snippets.py --input ../path/to/patents.jsonl
+```
 
-# 4. Annotate results with per-snippet antibiotic counts
+Optional flags:
+
+```
+--provider  nebius|google        LLM provider (default: nebius)
+--model     MODEL_ID             Override the default model for the provider
+--antibiotic-list  PATH          Path to antibiotic name list (default: ../CARD_ontology/antibiotics_list.txt)
+--window    INT                  Context window in characters around each match (default: 300)
+--max-retries  INT               Retries per snippet on transient errors (default: 15)
+```
+
+Output is written incrementally to `results/<input_basename>_snip_class_<model>.tsv`. The script can be safely interrupted and resumed with the same command — already-classified snippets are skipped.
+
+> **Cost note**: the script logs estimated token usage before starting. For large datasets (e.g. ~1.5 GB of patent text), run on a subset first to gauge costs.
+
+**3. Annotate results with antibiotic counts**
+
+```bash
 python CountABsnippets.py
 ```
 
-> **Cost warning**: `LLM_patent_class.py` runs on all input. If the dataset is large (e.g. ~1.5 GB of patent text in my usecase), try to run on a subset first and review the cost/token usage estimate before proceeding.
+**4. General patent classification** (product, organism, sector — no antibiotic filter)
+
+```bash
+python PatentClassification.py --input ../path/to/patents.jsonl
+```
+
+Optional flags:
+
+```
+--provider  nebius|google        LLM provider (default: nebius)
+--model     MODEL_ID             Override the default model for the provider
+--max-retries  INT               Retries per patent on transient errors (default: 15)
+```
+
+Output: `results/<input_basename>_claims_classifications_<model>.tsv`
 
 ## Classification Categories
+
+### Classify_Antibiotic_Snippets.py
 
 Each snippet (antibiotic mention + ±300 character context) is assigned one of:
 
@@ -107,14 +143,37 @@ Each snippet (antibiotic mention + ±300 character context) is assigned one of:
 | `EUKARYOTIC` | Antibiotic used in a eukaryotic (non-bacterial) context |
 | `UNKNOWN` | Irrelevant context, general chemical list, or unclear usage |
 
+### PatentClassification.py
+
+Each patent's claims and description are classified with four fields:
+
+| Field | Values |
+|---|---|
+| `End_Product` | Free text (e.g. "lysine", "amylase") |
+| `Organism` | Plant / bacterium / yeast / animal / human / unknown |
+| `Product_category` | Amino acid, oligosaccharide, vitamin, food colour/flavour, enzyme, peptide, vector, other |
+| `Sector` | food/feed, medicinal, diagnostic, molecular biology, chemistry, other |
+
+## LLM Providers
+
+Both classification scripts support two providers via `--provider`:
+
+| Provider | Default model | Env var |
+|---|---|---|
+| `nebius` (default) | `openai/gpt-oss-20b` | `NEBIUS_API_KEY` |
+| `google` | `gemma-4-31b-it` | `GOOGLE_API_KEY` |
+
+Any model available on the chosen provider can be selected with `--model`. The Nebius provider uses an OpenAI-compatible API, so any OpenAI-compatible endpoint can be targeted by pointing at the right base URL in the script.
+
 ## Key Dependencies
 
 | Library | Purpose |
 |---|---|
 | `flashtext` | Fast multi-keyword extraction from large text |
 | `obonet` / `networkx` | Parse and traverse CARD OBO ontology |
-| `openai` | Client for Nebius API (OpenAI-compatible) |
-| `pandas` | Data manipulation and CSV/TSV I/O |
+| `openai` | Client for Nebius/OpenAI-compatible APIs |
+| `google-genai` | Client for Google AI Studio |
+| `pandas` | Data manipulation and TSV/CSV I/O |
 | `python-dotenv` | Load API keys from `.env` |
 
 ## Data Sources
