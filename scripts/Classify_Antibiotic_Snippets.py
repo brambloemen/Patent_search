@@ -4,87 +4,121 @@ import re
 import pandas as pd
 from tqdm import tqdm
 import time
+import logging
+import argparse
+import os
 from flashtext import KeywordProcessor
 from openai import OpenAI
-import os
 from dotenv import load_dotenv
-"""
-Code is a manual/AI hybrid generated with gemini 3: https://gemini.google.com/share/fbb53ca43596
 
-Script analyzes patents claims and descriptions for mentions of antibiotics (derived using the CARD_aro_ontology.py script) 
-and classifies each mentions using a single prompt to an LLM (gpt-oss-20b). The prompt contains the mention and surrounding context.
-The output is a CSV file with the patent ID, snippet type (claim or description), the snippet text, the assigned category, and the reason for that category. 
-"""
-
-
-# --- Initialize Nebius Client (uses openAI system) ---
 load_dotenv()
-client = OpenAI(
-    base_url="https://api.tokenfactory.nebius.com/v1/",
-    api_key=os.environ.get("NEBIUS_API_KEY")
-)
 
-# --- Load Antibiotic Names ---
-antibiotic_file = '../CARD_ontology/antibiotics_list.txt'
+# --- Argument parsing ---
+parser = argparse.ArgumentParser(
+    description="Detect antibiotic mentions in Lens.org patent JSONL files and classify each snippet with an LLM."
+)
+parser.add_argument(
+    "--input",
+    required=True,
+    help="Path to the input JSONL file (one Lens.org patent record per line).",
+)
+parser.add_argument(
+    "--provider",
+    choices=["nebius", "google"],
+    default="nebius",
+    help="LLM provider: 'nebius' (default) or 'google' (Google AI Studio).",
+)
+parser.add_argument(
+    "--model",
+    default=None,
+    help="Override the default model for the chosen provider.",
+)
+parser.add_argument(
+    "--antibiotic-list",
+    default="../CARD_ontology/antibiotics_list.txt",
+    help="Path to the antibiotic name list (one name per line).",
+)
+parser.add_argument(
+    "--window",
+    type=int,
+    default=300,
+    help="Context window in characters around each antibiotic mention (default: 300).",
+)
+parser.add_argument(
+    "--max-retries",
+    type=int,
+    default=15,
+    help="Maximum retries per snippet before recording an error (default: 15).",
+)
+args = parser.parse_args()
+
+# --- Provider / client setup ---
+if args.provider == "google":
+    from google import genai
+    from google.genai import types as genai_types
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    MODEL_NAME = args.model or "gemma-4-31b-it"
+else:
+    client = OpenAI(
+        base_url="https://api.tokenfactory.nebius.com/v1/",
+        api_key=os.environ.get("NEBIUS_API_KEY"),
+    )
+    MODEL_NAME = args.model or "openai/gpt-oss-20b"
+
+OUTPUT_TAG = MODEL_NAME.replace("/", "_")
+INPUT_BASENAME = os.path.splitext(os.path.basename(args.input))[0]
+OUTPUT_PATH = f"../results/{INPUT_BASENAME}_snip_class_{OUTPUT_TAG}.tsv"
+LOG_PATH = f"../results/{INPUT_BASENAME}_snip_class_{OUTPUT_TAG}.log"
+
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# --- Load antibiotic keyword list ---
 antibiotics = []
-with open(antibiotic_file, 'r') as f:
+with open(args.antibiotic_list, "r") as f:
     for line in f:
         antibiotics.append(line.rstrip().lower())
-
 
 processor = KeywordProcessor(case_sensitive=False)
 for name in antibiotics:
     processor.add_keyword(name)
 
+log.info(f"Loaded {len(antibiotics)} antibiotic keywords from {args.antibiotic_list}")
 
-def get_merged_snippets_flashtext(text, processor, window=300):
-    """
-    Uses FlashText to find keyword locations and merges overlapping windows.
-    Returns a list of unique text snippets.
-    """
-    # extract_keywords with span_info returns: [('keyword', start_idx, end_idx), ...]
+
+def get_merged_snippets(text, processor, window=300):
+    """Find antibiotic keywords, build context windows, merge overlapping ones."""
     matches = processor.extract_keywords(text, span_info=True)
-    
     if not matches:
         return []
 
-    # Calculate raw intervals (start - window, end + window)
-    intervals = []
     text_len = len(text)
-    
-    for _, start, end in matches:
-        s_window = max(0, start - window)
-        e_window = min(text_len, end + window)
-        intervals.append([s_window, e_window])
+    intervals = sorted(
+        [max(0, s - window), min(text_len, e + window)]
+        for _, s, e in matches
+    )
 
-    # Sort by start position (FlashText usually returns sorted, but safety first)
-    intervals.sort(key=lambda x: x[0])
-
-    # Merge overlapping intervals
-    merged_snippets = []
-    if not intervals:
-        return []
-
-    curr_start, curr_end = intervals[0]
-
-    for next_start, next_end in intervals[1:]:
-        if next_start <= curr_end:
-            # Overlap: extend the current window
-            curr_end = max(curr_end, next_end)
+    merged = []
+    curr_s, curr_e = intervals[0]
+    for next_s, next_e in intervals[1:]:
+        if next_s <= curr_e:
+            curr_e = max(curr_e, next_e)
         else:
-            # No overlap: commit current and start new
-            merged_snippets.append(text[curr_start:curr_end])
-            curr_start, curr_end = next_start, next_end
-
-    # Append the final interval
-    merged_snippets.append(text[curr_start:curr_end])
-    
-    return merged_snippets
+            merged.append(text[curr_s:curr_e])
+            curr_s, curr_e = next_s, next_e
+    merged.append(text[curr_s:curr_e])
+    return merged
 
 
-# --- llm-classifier function ---
-MODEL_NAME="openai/gpt-oss-20b"
-# TODO: reason can be shorter to reduce output token count (largest fraction of output costs)
+# --- LLM prompt ---
 PROMPT_TEMPLATE = """You are a patent analyst. Classify the antibiotic-related patent snippet below.
 
 CATEGORIES:
@@ -99,189 +133,221 @@ SNIPPET:
 \"\"\"{snippet_text}\"\"\"
 
 Return ONLY JSON: {{"category": "BINGO"|"MARKER"|"AVOIDANCE"|"MARKER_AVOIDANCE"|"EUKARYOTIC"|"UNKNOWN", "reason": "one sentence"}}"""
-# PROMPT_TEMPLATE = """
-# INSTRUCTIONS:
-# You are a patent analyst. Classify the patent snippet below that describes use of antibiotic into one of these categories:
-# - BINGO: The antibiotic resistance marker is used in a production strain of food or feed products.
-# - MARKER: Antibiotic is used as bacterial selection marker.
-# - AVOIDANCE: Snippet describes non-antibiotic marker, marker-free systems, marker removal, or antibiotic susceptibility.
-# - MARKER_AVOIDANCE: Both MARKER and AVOIDANCE aspects are described.
-# - EUKARYOTIC: Snippet describes use of antibiotics in eukaryotic contexts.
-# - UNKNOWN: Irrelevant context or general chemical lists.
 
-# SNIPPET TO ANALYZE:
-# \"\"\"
-# {snippet_text}
-# \"\"\"
+RETRY_STATUS = {500, 502, 503, 504, 429}
+MAX_RETRIES = args.max_retries
 
-# RESPONSE FORMAT:
-# Return ONLY a JSON object: {{"category": "MARKER" | "AVOIDANCE" | "EUKARYOTIC" | "MARKER_AVOIDANCE" | "UNKNOWN" | "BINGO", "reason": "one sentence explanation"}}
-# """
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": ["BINGO", "MARKER", "AVOIDANCE", "MARKER_AVOIDANCE", "EUKARYOTIC", "UNKNOWN"],
+        },
+        "reason": {"type": "string"},
+    },
+    "required": ["category", "reason"],
+}
+
+
+def _call_google(full_prompt):
+    config = genai_types.GenerateContentConfig(
+        temperature=0.1,
+        response_mime_type="application/json",
+        response_schema=RESPONSE_SCHEMA,
+        thinking_config=genai_types.ThinkingConfig(thinking_level="MINIMAL"),
+    )
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=full_prompt,
+        config=config,
+    )
+    analysis = json.loads(response.text)
+    usage = response.usage_metadata
+    return analysis, {
+        "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
+        "output_tokens": getattr(usage, "candidates_token_count", 0) or 0,
+        "ratelimit_remaining_req": None,
+        "ratelimit_remaining_tok": None,
+        "was_over_limit": None,
+    }
+
+
+def _call_openai_compat(full_prompt):
+    raw_response = client.chat.completions.with_raw_response.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": full_prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+    )
+    headers = raw_response.headers
+    completion = raw_response.parse()
+    analysis = json.loads(completion.choices[0].message.content)
+    return analysis, {
+        "input_tokens": completion.usage.prompt_tokens,
+        "output_tokens": completion.usage.completion_tokens,
+        "ratelimit_remaining_req": headers.get("x-ratelimit-remaining-requests"),
+        "ratelimit_remaining_tok": headers.get("x-ratelimit-remaining-tokens"),
+        "was_over_limit": headers.get("x-ratelimit-over-limit", "no"),
+    }
+
 
 def categorize_with_llm(text_snippet):
-    """Sends the integrated prompt + data in a single request."""
-    # Inject snippet into the consolidated template
+    """Classify a single snippet, with exponential-backoff retry on transient errors."""
     full_prompt = PROMPT_TEMPLATE.format(snippet_text=text_snippet)
-    
+    call_fn = _call_google if args.provider == "google" else _call_openai_compat
+
     start_time = time.perf_counter()
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            analysis, usage = call_fn(full_prompt)
+            duration = time.perf_counter() - start_time
+            if attempt > 0:
+                log.info(f"Succeeded after {attempt} retries ({duration:.1f}s)")
+            analysis.update({**usage, "duration_sec": round(duration, 3), "retries": attempt})
+            return analysis
+
+        except Exception as e:
+            last_err = e
+            status = getattr(e, "status_code", None) or getattr(e, "code", None)
+            if status not in RETRY_STATUS and not isinstance(e, json.JSONDecodeError):
+                log.warning(f"Non-retryable error (status={status}): {e}")
+                break
+            if attempt == MAX_RETRIES - 1:
+                log.error(f"Exhausted {MAX_RETRIES} retries. Last error: {e}")
+                break
+
+            if status == 429:
+                m = re.search(r"'retryDelay':\s*'(\d+)s'", str(e)) if args.provider == "google" else None
+                retry_delay = int(m.group(1)) if m else 0
+                backoff = max(retry_delay, 2 ** attempt + 0.5 * attempt)
+                if attempt >= 9:
+                    backoff += 3600
+                    log.warning(f"Attempt {attempt+1}/{MAX_RETRIES} — 10+ consecutive quota errors, adding 1h. Retrying in {backoff:.0f}s")
+                else:
+                    log.warning(f"Attempt {attempt+1}/{MAX_RETRIES} failed (429) — retrying in {backoff:.0f}s")
+            else:
+                backoff = 2 ** attempt + 0.5 * attempt
+                log.warning(f"Attempt {attempt+1}/{MAX_RETRIES} failed (status={status}): {e} — retrying in {backoff:.1f}s")
+            time.sleep(backoff)
+
+    duration = time.perf_counter() - start_time
+    return {
+        "category": "ERROR",
+        "reason": str(last_err),
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "duration_sec": round(duration, 3),
+        "ratelimit_remaining_req": None,
+        "ratelimit_remaining_tok": None,
+        "was_over_limit": None,
+        "retries": MAX_RETRIES,
+    }
+
+
+OUTPUT_COLUMNS = [
+    "patent_id", "snippet_type", "snippet_text", "category", "reason",
+    "input_tokens", "output_tokens", "duration_sec",
+    "ratelimit_remaining_req", "ratelimit_remaining_tok", "was_over_limit", "retries",
+]
+
+# --- Checkpoint: skip snippets already classified in a previous run ---
+already_done = set()
+output_exists = os.path.exists(OUTPUT_PATH)
+if output_exists:
     try:
-        raw_response = client.chat.completions.with_raw_response.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": full_prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.1
-        )
-        
-        headers = raw_response.headers
-        remaining_req = headers.get("x-ratelimit-remaining-requests")
-        remaining_tok = headers.get("x-ratelimit-remaining-tokens")
-        over_limit = headers.get("x-ratelimit-over-limit", "no")
-
-        
-        completion = raw_response.parse()
-        analysis = json.loads(completion.choices[0].message.content)
-        duration = time.perf_counter() - start_time
-        analysis.update({
-            'input_tokens': completion.usage.prompt_tokens,
-            'output_tokens': completion.usage.completion_tokens,
-            'duration_sec': round(duration, 3),
-            'ratelimit_remaining_req': remaining_req,
-            'ratelimit_remaining_tok': remaining_tok,
-            'was_over_limit': over_limit
-        })
-        return analysis
-    
+        checkpoint = pd.read_csv(OUTPUT_PATH, sep="\t", usecols=["patent_id", "snippet_type", "snippet_text"])
+        already_done = set(zip(
+            checkpoint["patent_id"].astype(str),
+            checkpoint["snippet_type"],
+            checkpoint["snippet_text"],
+        ))
+        log.info(f"Resuming: {len(already_done)} snippets already classified, skipping them.")
     except Exception as e:
-        duration = time.perf_counter() - start_time
-        return {
-            "category": "ERROR",
-            "reason": str(e),
-            'input_tokens': 0,
-            'output_tokens': 0,
-            'duration_sec': round(duration, 3),
-            'ratelimit_remaining_req': None,
-            'ratelimit_remaining_tok': None,
-            'was_over_limit': None
-        }
+        log.warning(f"Could not read checkpoint file: {e} — starting fresh.")
+        output_exists = False
 
+# --- Read and keyword-filter patents ---
+log.info(f"Reading patents from {args.input}")
+snippets = {}
 
-
-path = "/scratch/brbloemen/ARGUMENT/Patent_search/claims_FoodFeedSuppVitEnz_C12N.json"
-
-with open(path, 'r', encoding='utf-8') as f_in:
-
-    snippets = {}
-    rows = []
-
-    counter = 0
-    for line in tqdm(f_in):
+with open(args.input, "r", encoding="utf-8-sig") as f_in:
+    for line in tqdm(f_in, desc="Scanning patents"):
         if not line.strip():
             continue
-        
-        # store patent information
         patent = json.loads(line)
-        lens_id = patent.get('lens_id')
-        rows.append({
-            'lens_id': lens_id,
-            'date_published': patent.get('date_published'),
-            'jurisdiction': patent.get('jurisdiction'),
-            'doc_number': patent.get('doc_number'),
-            'title': patent.get('title', {}).get('text', 'N/A')
-        })
-        
-        # 1. Extract and Process Claims
-        claims_data = patent.get('claims', [])
-        
-        if claims_data != None and len(claims_data) > 0:
-            claims_data = claims_data[0]["claims"]
-            all_claims_text = " ".join([
-                " ".join(claim.get('claim_text', [])) 
-                for claim in claims_data
-            ])        
-            
+        lens_id = patent.get("lens_id")
+
+        claims_data = patent.get("claims", [])
+        if claims_data:
+            all_claims_text = " ".join(
+                " ".join(claim.get("claim_text", []))
+                for claim in claims_data[0]["claims"]
+            )
         else:
             all_claims_text = ""
 
-        # 2. Extract and Process Description
-        # Lens descriptions can be a string or a list/dict depending on the version
-        desc_data = patent.get('description', {})
-        if isinstance(desc_data, dict):
-            description_text = desc_data.get('text', "")
-        else:
-            description_text = str(desc_data)
-        
-        matches_claims = processor.extract_keywords(all_claims_text)
-        matches_desc = processor.extract_keywords(description_text)
+        desc_data = patent.get("description", {})
+        description_text = desc_data.get("text", "") if isinstance(desc_data, dict) else str(desc_data)
 
-        if not matches_claims and not matches_desc:
-            continue  # No antibiotic mentions found
-        else:
-            # extract snippets from patent claims and description
-            snippets_claims = get_merged_snippets_flashtext(all_claims_text, processor)
-            snippets_desc = get_merged_snippets_flashtext(description_text, processor)
-            snippets[lens_id] = {
-                'snippets_claims': snippets_claims,
-                'snippets_desc': snippets_desc
-            }
-            # counter += 1
-            # if counter >= 50:
-            #     break  # test run
+        snips_claims = get_merged_snippets(all_claims_text, processor, args.window)
+        snips_desc = get_merged_snippets(description_text, processor, args.window)
 
-    patents = pd.DataFrame(rows)
-    patents.to_csv('../results/claimsFoodFeedVitSuppEnz_C12N_patents_metadata.csv', index=False)
+        if snips_claims or snips_desc:
+            snippets[lens_id] = {"claims": snips_claims, "desc": snips_desc}
 
-test_patent = snippets.popitem()
-test_patent_id = test_patent[0]
-test_snippet = snippets.popitem()[1]['snippets_desc'][0]
-print(test_patent_id)
-print(test_snippet)
-print(categorize_with_llm(test_snippet)["category"])  # test run
-total_snippets = sum(len(v['snippets_claims']) + len(v['snippets_desc']) for v in snippets.values())
-total_snippets_length = sum(len(snip) for v in snippets.values() for snip in v['snippets_claims'] + v['snippets_desc'])
+total_snippets = sum(len(v["claims"]) + len(v["desc"]) for v in snippets.values())
+total_chars = sum(
+    len(s) for v in snippets.values() for s in v["claims"] + v["desc"]
+)
+log.info(f"Patents with antibiotic mentions: {len(snippets)}")
+log.info(f"Total snippets to classify: {total_snippets}")
+log.info(
+    f"Estimated tokens: "
+    f"{(total_snippets * len(PROMPT_TEMPLATE) + total_chars) / 4 / 1e6:.2f}M "
+    f"(~4 chars/token)"
+)
 
-"""
-To get an idea of costs: total number of snippets (= total LLM calls) and total character count (~ linear relation to nr tokens).
-"""
-print(f"Total snippets to classify: {total_snippets}")
-print(f"Total snippet length: {total_snippets_length / 10**6}M characters.")
-print(f"Estimated total tokens: {total_snippets*len(PROMPT_TEMPLATE)/4/10**6 + total_snippets_length/4/10**6}M tokens (assuming ~4 chars/token).")
+# --- Classify ---
+consecutive_errors = 0
+MAX_CONSECUTIVE_ERRORS = 15
 
+with open(OUTPUT_PATH, "a", newline="", encoding="utf-8") as f_out:
+    writer = csv.DictWriter(f_out, fieldnames=OUTPUT_COLUMNS, delimiter="\t", extrasaction="ignore")
+    if not output_exists:
+        writer.writeheader()
 
-snippet_classifications = pd.DataFrame(columns=['patent_id', 'snippet_type', 
-                                                'snippet_text', 'category', 
-                                                'reason', 'input_tokens', 
-                                                'output_tokens', 'duration_sec', 
-                                                'ratelimit_remaining_req', 
-                                                'ratelimit_remaining_tok', 'was_over_limit'])
+    total_input_tokens = 0
+    total_output_tokens = 0
 
-"""
-Loop iterating through all patents in dataset.
-! Best run some trials on a subset before running all patents, to get an idea of costs and runtime.
-"""
-for pat, snip in tqdm(snippets.items()):
-    for claim_snip in snip['snippets_claims']:
-        analysis = categorize_with_llm(claim_snip)
-        
-        new_row = pd.DataFrame([{
-            'patent_id': pat,
-            'snippet_type': 'claim',
-            'snippet_text': claim_snip,
-            **analysis
-        }])
+    for pat, snip in tqdm(snippets.items(), desc="Classifying patents"):
+        for snip_type, snip_list in [("claim", snip["claims"]), ("description", snip["desc"])]:
+            for text in snip_list:
+                if (str(pat), snip_type, text) in already_done:
+                    continue
 
-        snippet_classifications = pd.concat([snippet_classifications, new_row], ignore_index=True)
-    
-    for desc_snip in snip['snippets_desc']:
-        analysis = categorize_with_llm(desc_snip)
-        
-        new_row = pd.DataFrame([{
-            'patent_id': pat,
-            'snippet_type': 'description',
-            'snippet_text': desc_snip,
-            **analysis
-        }])
+                analysis = categorize_with_llm(text)
+                writer.writerow({
+                    "patent_id": pat,
+                    "snippet_type": snip_type,
+                    "snippet_text": text,
+                    **analysis,
+                })
+                f_out.flush()
 
-        snippet_classifications = pd.concat([snippet_classifications, new_row], ignore_index=True)
+                if analysis.get("category") == "ERROR":
+                    consecutive_errors += 1
+                    log.error(
+                        f"Patent {pat} snippet failed: {analysis['reason']} "
+                        f"({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS} consecutive errors)"
+                    )
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        log.error(f"Stopping: {MAX_CONSECUTIVE_ERRORS} consecutive errors. Resume with the same command.")
+                        raise SystemExit(1)
+                else:
+                    consecutive_errors = 0
+                    total_input_tokens += analysis.get("input_tokens", 0)
+                    total_output_tokens += analysis.get("output_tokens", 0)
 
-snippet_classifications.to_csv('../results/claimsFoodFeedVitSuppEnz_C12N_snip_class_gptoss20b.tsv', sep="\t", index=False)
-
+log.info(f"Run complete. Input tokens: {total_input_tokens}, Output tokens: {total_output_tokens}")

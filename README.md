@@ -20,15 +20,22 @@ Lens API export (JSONL)
 CARD_aro_ontology.py                               PatentClassification.py
 → antibiotics_list.txt (672 antibiotic names)      → end product / organism /
         │                                            sector classification (TSV)
-        ▼
-Classify_Antibiotic_Snippets.py
-  ├─ FlashText keyword match
-  ├─ Context window extraction (±300 chars)
-  └─ LLM classification of each snippet (TSV)
-        │
-        ▼
-CountABsnippets.py
-→ annotated results with per-snippet antibiotic counts
+        ▼                                                       │
+Classify_Antibiotic_Snippets.py                                 │
+  ├─ FlashText keyword match                                    │
+  ├─ Context window extraction (±300 chars)                     │
+  └─ LLM classification of each snippet (TSV)                   │
+        │                                                       │
+        ▼                                                       │
+CountABsnippets.py                                              │
+→ annotated results with per-snippet antibiotic counts          │
+        │                                                       │
+        └───────────────────────┬───────────────────────────────┘
+                                ▼
+                      Integrate_Results.py
+                  → one row per patent: metadata +
+                    category counts + antibiotics +
+                    end product / organism / sector (TSV)
 ```
 
 ## Repository Structure
@@ -40,7 +47,8 @@ Patent_search/
 │   ├── Patent_metadata.py                # Extract patent metadata from Lens export
 │   ├── Classify_Antibiotic_Snippets.py   # Antibiotic mention detection + LLM classification
 │   ├── PatentClassification.py           # General patent product/sector classification
-│   └── CountABsnippets.py                # Annotate snippet results with antibiotic counts
+│   ├── CountABsnippets.py                # Annotate snippet results with antibiotic counts
+│   └── Integrate_Results.py              # Merge all per-patent outputs into one summary table
 ├── CARD_ontology/
 │   ├── aro.json / aro.obo                # Antibiotic Resistance Ontology (CARD 2023)
 │   ├── mo.json, ro.json                  # Model and Relationship Ontologies
@@ -127,6 +135,24 @@ Optional flags:
 ```
 
 Output: `results/<input_basename>_claims_classifications_<model>.tsv`
+
+**5. Integrate results** (merge metadata + snippet classifications + general classification into one table)
+
+```bash
+python Integrate_Results.py \
+    --metadata       ../results/Patent_Metadata.tsv \
+    --snippets       ../results/patents_snip_class_openai_gpt-oss-20b_with_counts.tsv \
+    --classification ../results/patents_claims_classifications_openai_gpt-oss-20b.tsv \
+    --output         ../results/patent_summary.tsv
+```
+
+All input flags are optional — pass whichever subset of outputs you want to combine. The script produces one row per patent with patent metadata, per-category snippet counts (`n_BINGO`, `n_MARKER`, ...), the union of antibiotics found across all snippets, and the general end-product / organism / sector classification. Raw claim and description text are excluded.
+
+Optional flags:
+
+```
+--how  outer|inner|left          Join strategy across input tables (default: outer)
+```
 
 ## Classification Categories
 

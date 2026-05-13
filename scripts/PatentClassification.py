@@ -52,6 +52,7 @@ else:
     OUTPUT_TAG = MODEL_NAME.replace("/", "_")
 
 INPUT_BASENAME = os.path.splitext(os.path.basename(args.input))[0]
+os.makedirs('../results', exist_ok=True)
 OUTPUT_PATH = f'../results/{INPUT_BASENAME}_claims_classifications_{OUTPUT_TAG}.tsv'
 LOG_PATH = f'../results/{INPUT_BASENAME}_classification_{OUTPUT_TAG}.log'
 
@@ -70,7 +71,7 @@ log = logging.getLogger(__name__)
 PROMPT_TEMPLATE = """
 INSTRUCTIONS:
 You are a patent analyst. From the following patent abstract and claims, identify:
-(1) the end product,
+(1) the end product (as specifically as possible),
 (2) type of production organism (if mentioned). This can be plant, bacteria, yeast, animal, human. If bacterium or yeast, specify the species or genus if and only if a single species or genus is mentioned. Otherwise default to the default "bacterium" or "yeast". If no production organism is mentioned, return "unknown".
 (3) Category of end product, one of: "Amino acid", "oligosaccharide", "vitamin", "food colour/flavour", "enzyme", "peptide", "vector", "other"
 (4) Sector: whether it falls into one of: "food/feed" (including food industry enzymes, amino acids), "medicinal", "diagnostic", "molecular biology", "chemistry". If it doesn't clearly fall into one of these, classify as "other". When multiple categories apply and food/feed is one of them, choose food/feed.
